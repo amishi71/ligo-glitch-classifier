@@ -1,62 +1,85 @@
-"""Helper for setting up the data/ directory. Downloading the Gravity Spy
-Training Set itself is a manual step (Zenodo doesn't have a stable API
-endpoint for large asset bundles that's worth scripting around) — this
-script just creates the expected folder layout and checks what's missing.
+"""Download Gravity Spy data from Zenodo — verified record IDs and filenames.
 
-Manual steps:
-  1. Go to Zenodo and search "Gravity Spy Training Set" (Bahaadini et al.).
-     Download the release archive.
-  2. Extract it so you end up with:
-       data/train/<class_name>/*.png
-       data/validation/<class_name>/*.png
-       data/test/<class_name>/*.png
-  3. Also from Zenodo, download:
-       - "Gravity Spy Machine Learning Classifications ... O1, O2, O3a, O3b"
-         (DOI 10.5281/zenodo.5649211) -> save as data/labels/ml_classifications.csv
-       - "Gravity Spy Volunteer Classifications ... O1, O2, O3a, O3b"
-         (DOI 10.5281/zenodo.13904422) -> save as data/labels/volunteer_classifications.csv
+Run this on Colab, not locally (the training set alone is 3.1-5.5GB).
 
 Usage:
-    python -m src.download_data --config configs/config.yaml
+    python src/download_data.py --training-set --ml-labels H1_O3a --volunteer-labels
 """
 import argparse
+import bz2
 import os
+import shutil
+import subprocess
 
-from src.utils import load_config
+TRAINING_SET_H5_URL = "https://zenodo.org/records/1486046/files/trainingsetv1d1.h5?download=1"
+TRAINING_SET_TARGZ_URL = "https://zenodo.org/records/1486046/files/trainingsetv1d1.tar.gz?download=1"
+ML_CLASSIFICATIONS_BASE = "https://zenodo.org/records/5649212/files/{name}.csv?download=1"
+VOLUNTEER_CLASSIFICATIONS_URL = "https://zenodo.org/records/13904422/files/classifications.csv.bz2?download=1"
+
+VALID_ML_FILES = [
+    "H1_O1", "H1_O2", "H1_O3a", "H1_O3b",
+    "L1_O1", "L1_O2", "L1_O3a", "L1_O3b",
+]
+
+
+def _wget(url, out_path):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    subprocess.run(["wget", "-q", "--show-progress", "-O", out_path, url], check=True)
+
+
+def download_training_set(data_dir="data/raw", fmt="h5"):
+    if fmt == "h5":
+        out = os.path.join(data_dir, "trainingsetv1d1.h5")
+        _wget(TRAINING_SET_H5_URL, out)
+    elif fmt == "tar":
+        out = os.path.join(data_dir, "trainingsetv1d1.tar.gz")
+        _wget(TRAINING_SET_TARGZ_URL, out)
+        subprocess.run(["tar", "-xzf", out, "-C", data_dir], check=True)
+    else:
+        raise ValueError("fmt must be 'h5' or 'tar'")
+    return out
+
+
+def download_ml_labels(names, data_dir="data/labels"):
+    paths = []
+    for name in names:
+        if name not in VALID_ML_FILES:
+            raise ValueError(f"{name} is not one of {VALID_ML_FILES}")
+        out = os.path.join(data_dir, f"{name}.csv")
+        _wget(ML_CLASSIFICATIONS_BASE.format(name=name), out)
+        paths.append(out)
+    return paths
+
+
+def download_volunteer_labels(data_dir="data/labels"):
+    out_bz2 = os.path.join(data_dir, "classifications.csv.bz2")
+    _wget(VOLUNTEER_CLASSIFICATIONS_URL, out_bz2)
+    out_csv = out_bz2[:-4]
+    with bz2.open(out_bz2, "rb") as src, open(out_csv, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    return out_csv
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/config.yaml")
+    parser = argparse.ArgumentParser(description="Download Gravity Spy data from Zenodo.")
+    parser.add_argument("--training-set", action="store_true", help="download the pre-rendered training set")
+    parser.add_argument("--training-set-format", choices=["h5", "tar"], default="h5")
+    parser.add_argument("--ml-labels", nargs="*", default=[], help=f"any of {VALID_ML_FILES}")
+    parser.add_argument("--volunteer-labels", action="store_true")
+    parser.add_argument("--data-dir", default="data")
     args = parser.parse_args()
-    config = load_config(args.config)
 
-    required_dirs = [
-        config["data"]["train_dir"],
-        config["data"]["val_dir"],
-        config["data"]["test_dir"],
-        os.path.dirname(config["data"]["ml_labels_csv"]),
-    ]
-    for d in required_dirs:
-        os.makedirs(d, exist_ok=True)
+    if args.training_set:
+        path = download_training_set(os.path.join(args.data_dir, "raw"), args.training_set_format)
+        print("Downloaded training set to", path)
 
-    print("Created expected data directories:")
-    for d in required_dirs:
-        print(f"  {d}")
+    if args.ml_labels:
+        paths = download_ml_labels(args.ml_labels, os.path.join(args.data_dir, "labels"))
+        print("Downloaded ML labels:", paths)
 
-    print("\nChecking for data...")
-    train_dir = config["data"]["train_dir"]
-    if os.path.isdir(train_dir) and len(os.listdir(train_dir)) > 0:
-        n_classes = len([d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))])
-        print(f"  Found {n_classes} class folders in {train_dir}")
-    else:
-        print(f"  {train_dir} is empty. See the docstring at the top of this file "
-              f"for manual download instructions from Zenodo.")
-
-    for key in ["ml_labels_csv", "volunteer_labels_csv"]:
-        path = config["data"][key]
-        status = "found" if os.path.exists(path) else "MISSING"
-        print(f"  {path}: {status}")
+    if args.volunteer_labels:
+        path = download_volunteer_labels(os.path.join(args.data_dir, "labels"))
+        print("Downloaded volunteer labels to", path)
 
 
 if __name__ == "__main__":

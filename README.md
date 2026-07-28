@@ -1,101 +1,122 @@
 # LIGO Glitch Classifier
 
-A spectrogram-based CNN classifier for LIGO gravitational-wave detector glitches, benchmarked against the [Gravity Spy](https://www.zooniverse.org/projects/zooniverse/gravity-spy) citizen-science labels.
+CNN-based classifier for LIGO gravitational-wave detector glitches, benchmarked
+against Gravity Spy citizen-science labels. See `project_brief.md` (not included
+in this scaffold — keep your original brief alongside this) for the full
+scientific background, timeline, and stretch goals.
 
-LIGO's interferometers are sensitive enough to pick up large amounts of non-astrophysical noise ("glitches") from sources like scattered light, seismic activity, and electronics. This project trains a CNN on Omega-scan spectrogram images to classify glitches into the Gravity Spy taxonomy (22 classes), then compares model predictions against Gravity Spy's own published machine-learning labels and human volunteer consensus labels.
-
-## Project structure
+## Repo structure
 
 ```
 ligo-glitch-classifier/
-├── configs/
-│   └── config.yaml           # paths + hyperparameters
-├── data/
-│   ├── train/ validation/ test/   # class-labeled spectrogram images
-│   └── labels/                    # Gravity Spy ML + volunteer label CSVs
-├── src/
-│   ├── dataset.py             # Dataset / DataLoader construction
-│   ├── models.py              # single-view + multi-view CNN architectures
-│   ├── train.py                # training loop
-│   ├── evaluate.py            # test-set evaluation, confusion matrix
-│   ├── benchmark.py           # compare predictions vs Gravity Spy labels
-│   ├── gradcam_demo.py        # Grad-CAM interpretability check (stretch)
-│   ├── download_data.py       # data folder setup + download instructions
-│   └── utils.py                # config loading, seeding, device selection
-├── checkpoints/                # saved model weights (gitignored)
-├── outputs/                    # generated reports, plots, predictions (gitignored)
-├── notebooks/                  # exploratory analysis
+├── README.md
 ├── requirements.txt
-└── README.md
+├── .gitignore
+├── src/
+│   ├── dataset.py       # GravitySpyH5Dataset + dataloader helper
+│   ├── model.py          # ResNet18 transfer-learning baseline
+│   ├── download_data.py  # Zenodo downloader (verified URLs)
+│   ├── train.py           # training CLI
+│   └── evaluate.py       # evaluation CLI (macro-F1, confusion matrix)
+├── notebooks/
+│   └── colab_run.ipynb   # thin notebook that drives the scripts above on Colab
+├── tests/
+│   └── test_dataset.py   # local, no-GPU, no-download sanity test
+├── data/          # gitignored — created by download_data.py
+├── checkpoints/   # gitignored — created by train.py
+└── outputs/       # gitignored — created by evaluate.py
 ```
 
-## Setup
+## What runs where
+
+**Local (your laptop):** editing code, `git` commits/pushes, and the one test
+file (`tests/test_dataset.py`) — it builds a tiny fake HDF5 file in memory, so
+it needs no download and no GPU. This is where you catch bugs in the data
+pipeline before burning Colab GPU time on them.
+
+**Colab (`notebooks/colab_run.ipynb`):** everything that needs a GPU or the
+real dataset — downloading the ~3.1GB training set, training, evaluating.
+Nothing here needs authentication as long as the GitHub repo stays public.
+
+Don't try to download the training set or train locally unless your laptop
+has a real GPU and you don't mind a multi-GB download — that's what Colab's
+free T4 is for.
+
+## Local setup
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
+git clone https://github.com/amishi71/ligo-glitch-classifier.git
+cd ligo-glitch-classifier
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+pytest tests/                     # should pass in a few seconds, no download needed
 ```
 
-Verify the install:
+If `pytest tests/` doesn't pass, don't move on to Colab yet — fix it here first,
+it's much faster to iterate on than a Colab session.
+
+When you make changes:
+
 ```bash
-python3 -c "import torch, gwpy; print('Torch:', torch.__version__); print('GWpy:', gwpy.__version__)"
+git add -A
+git commit -m "describe the change"
+git push
 ```
 
-## Getting the data
+## Running on Colab
 
-```bash
-python -m src.download_data
-```
+Open `notebooks/colab_run.ipynb` in Colab (upload it, or open directly from
+GitHub via *File > Open notebook > GitHub* and pasting the repo URL). Set
+**Runtime > Change runtime type > T4 GPU**, then run the cells in order:
 
-This creates the expected `data/` folder layout and tells you what's missing. You then need to manually download (Zenodo, free/open access):
+1. **Clone the repo** — pulls whatever you last pushed from local.
+2. **Install requirements** — `pip install -r requirements.txt`.
+3. **Inspect the `.h5` split names** — the Zenodo description confirms
+   `validation` as a literal split name but not the other two; this cell
+   prints the real ones so you can confirm `train`/`test` before relying on
+   the defaults in `src/dataset.py` and `src/train.py`.
+4. **Download data**:
+   ```bash
+   python src/download_data.py --training-set --ml-labels H1_O3a --volunteer-labels
+   ```
+5. **Train**:
+   ```bash
+   python src/train.py --epochs 15
+   ```
+   Useful flags: `--classes Blip Whistle Chirp` to pick your own subset,
+   `--all-classes` for the full 22-class taxonomy, `--duration 2.0` to try a
+   different spectrogram window.
+6. **Evaluate**:
+   ```bash
+   python src/evaluate.py
+   ```
+   Prints accuracy, macro-F1, a full classification report, and saves a
+   confusion matrix to `outputs/confusion_matrix.png`.
+7. **(Optional) Back up to Drive** — Colab sessions are ephemeral;
+   `checkpoints/` and `outputs/` disappear when the runtime recycles unless
+   you copy them to Drive or download them.
 
-1. **Gravity Spy Training Set** — pre-rendered spectrogram images, sorted by class. Extract into `data/train/`, `data/validation/`, `data/test/`.
-2. **Gravity Spy ML Classifications (O1–O3b)** — DOI `10.5281/zenodo.5649211`. Save as `data/labels/ml_classifications.csv`.
-3. **Gravity Spy Volunteer Classifications (O1–O3b)** — DOI `10.5281/zenodo.13904422`. Save as `data/labels/volunteer_classifications.csv`.
+Colab sessions reset their filesystem between sessions, so you'll re-run
+steps 1–2 (and usually 4, unless you cache `data/` on Drive) every time you
+come back.
 
-## Usage
+## Data sources (verified against live Zenodo records)
 
-**Train the baseline model:**
-```bash
-python -m src.train --config configs/config.yaml
-```
-Saves the best checkpoint to `checkpoints/best_model.pt`.
+| What | Record | File(s) |
+|---|---|---|
+| Pre-rendered training images (labeled, pre-split train/val/test) | [1486046](https://zenodo.org/records/1486046) | `trainingsetv1d1.h5` (3.1GB) or `trainingsetv1d1.tar.gz` (5.5GB) |
+| ML classifications | [5649212](https://zenodo.org/records/5649212) | one CSV per detector+run, e.g. `H1_O3a.csv`, `L1_O3b.csv` |
+| Volunteer classifications | [13904422](https://zenodo.org/records/13904422) | `classifications.csv.bz2` (covers all runs) |
 
-**Evaluate on the test set:**
-```bash
-python -m src.evaluate --config configs/config.yaml
-```
-Produces `outputs/classification_report.txt`, `outputs/confusion_matrix.png`, and `outputs/test_predictions.csv`.
+`src/download_data.py` uses these exact URLs — if a download 404s in the
+future, it means Zenodo has moved something, not that the script is wrong;
+re-check the record page before changing the URL.
 
-**Benchmark against Gravity Spy labels:**
-```bash
-python -m src.benchmark --config configs/config.yaml
-```
-Reports agreement rate with Gravity Spy's ML and volunteer labels, and saves disagreement cases to `outputs/disagreements_for_review.csv` for manual inspection.
+## Benchmarking against Gravity Spy
 
-**(Stretch) Grad-CAM interpretability check:**
-```bash
-python -m src.gradcam_demo --config configs/config.yaml --index 0
-```
-
-## Results
-
-_Fill in after training:_
-
-| Model                             | Accuracy | Macro-F1 | Agreement w/ GSpy ML | Agreement w/ Volunteers |
-| --------------------------------- | -------- | -------- | -------------------- | ----------------------- |
-| Gravity Spy published ML CNN      | ~97–98%  | —        | —                    | —                       |
-| This model (single-view ResNet18) | TBD      | TBD      | TBD                  | TBD                     |
-
-## References
-
-- Bahaadini, S. et al. (2018), *Machine learning for Gravity Spy: Glitch classification and dataset*.
-- Zevin, M. et al. (2017), *Gravity Spy: Integrating Advanced LIGO Detector Characterization, Machine Learning, and Citizen Science*.
-- Glanzer, J. et al. (2023), *Data quality up to the third observing run of Advanced LIGO: Gravity Spy glitch classifications*.
-- Data and labels: [Zenodo Gravity Spy releases](https://zenodo.org).
-
-## License
-
-Add a license of your choice (MIT is a common default for research/portfolio code).
+`src/download_data.py --ml-labels ...` and `--volunteer-labels` pull the
+comparison data. Join your test-set predictions against those CSVs on
+`gravityspy_id` to build the comparison table from the project brief's
+evaluation plan — that step isn't automated here yet since it depends on
+which run/detector you're comparing against.

@@ -1,31 +1,11 @@
-# Environments
-venv/
-.venv/
+data/
+checkpoints/
+outputs/
 __pycache__/
 *.pyc
-
-# Data (too large / not yours to redistribute — download via src/download_data.py)
-data/train/*
-data/validation/*
-data/test/*
-data/labels/*
-!data/train/.gitkeep
-!data/validation/.gitkeep
-!data/test/.gitkeep
-!data/labels/.gitkeep
-
-# Model artifacts
-checkpoints/*
-!checkpoints/.gitkeep
-
-# Generated outputs
-outputs/*
-!outputs/.gitkeep
-
-# OS / editor
-.DS_Store
-.vscode/
-.idea/
-
-# Jupyter
 .ipynb_checkpoints/
+.DS_Store
+*.egg-info/
+venv/
+.venv/
+.pytest_cache/

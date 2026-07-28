@@ -1,86 +1,71 @@
-"""Evaluate the trained model on the test set: classification report + confusion matrix.
+"""Evaluate a trained checkpoint: accuracy, macro-F1, confusion matrix.
 
-Usage:
-    python -m src.evaluate --config configs/config.yaml
+Run this on Colab, right after train.py. Usage:
+    python src/evaluate.py --checkpoint checkpoints/best_model.pt
 """
 import argparse
 import os
 
-import matplotlib.pyplot as plt
-import seaborn as sns
+import numpy as np
 import torch
-from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 
-from src.dataset import build_dataloaders
-from src.models import build_single_view_model
-from src.utils import load_config, get_device, list_classes
+from dataset import get_dataloaders
+from model import build_model
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/config.yaml")
+    parser = argparse.ArgumentParser(description="Evaluate a trained Gravity Spy CNN checkpoint.")
+    parser.add_argument("--data-path", default="data/raw/trainingsetv1d1.h5")
+    parser.add_argument("--checkpoint", default="checkpoints/best_model.pt")
+    parser.add_argument("--duration", default="1.0", choices=["0.5", "1.0", "2.0", "4.0"])
+    parser.add_argument("--split-train", default="train")
+    parser.add_argument("--split-val", default="validation")
+    parser.add_argument("--split-test", default="test")
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--output-dir", default="outputs")
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    device = get_device()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    classes = ckpt["classes"]
 
-    checkpoint_path = os.path.join(
-        config["output"]["checkpoint_dir"], config["output"]["best_model_name"]
+    split_names = {"train": args.split_train, "val": args.split_val, "test": args.split_test}
+    _, _, test_loader, _, _, test_ds = get_dataloaders(
+        args.data_path, split_names, classes, args.duration, args.batch_size, image_size=args.image_size,
     )
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    classes = checkpoint["classes"]
-    print(f"Loaded checkpoint with {len(classes)} classes")
 
-    _, _, test_loader, _, _, test_ds = build_dataloaders(config, classes)
-
-    model = build_single_view_model(
-        num_classes=len(classes),
-        backbone_name=config["model"]["backbone"],
-        pretrained=False,
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model = build_model(len(classes)).to(device)
+    model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    all_preds, all_labels = [], []
+    all_preds, all_true = [], []
     with torch.no_grad():
-        for imgs, labels in test_loader:
-            outputs = model(imgs.to(device))
-            preds = outputs.argmax(1).cpu().numpy()
+        for x, y in test_loader:
+            x = x.to(device)
+            preds = model(x).argmax(1).cpu().numpy()
             all_preds.extend(preds)
-            all_labels.extend(labels.numpy())
+            all_true.extend(y.numpy())
 
-    report = classification_report(all_labels, all_preds, target_names=classes, zero_division=0)
-    print(report)
+    acc = (np.array(all_preds) == np.array(all_true)).mean()
+    macro_f1 = f1_score(all_true, all_preds, average="macro")
+    print(f"Test accuracy: {acc:.4f}   Macro-F1: {macro_f1:.4f}")
+    print(classification_report(all_true, all_preds, target_names=classes))
 
-    os.makedirs(config["output"]["outputs_dir"], exist_ok=True)
-    report_path = os.path.join(config["output"]["outputs_dir"], "classification_report.txt")
-    with open(report_path, "w") as f:
-        f.write(report)
-    print(f"Saved report to {report_path}")
-
-    cm = confusion_matrix(all_labels, all_preds)
-    plt.figure(figsize=(12, 10))
-    sns.heatmap(cm, xticklabels=classes, yticklabels=classes, cmap="Blues", annot=False)
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
-    plt.xticks(rotation=90)
-    plt.yticks(rotation=0)
+    os.makedirs(args.output_dir, exist_ok=True)
+    cm = confusion_matrix(all_true, all_preds)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_xticks(range(len(classes))); ax.set_xticklabels(classes, rotation=90)
+    ax.set_yticks(range(len(classes))); ax.set_yticklabels(classes)
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    plt.colorbar(im)
     plt.tight_layout()
-    cm_path = os.path.join(config["output"]["outputs_dir"], "confusion_matrix.png")
-    plt.savefig(cm_path, dpi=150)
-    print(f"Saved confusion matrix to {cm_path}")
-
-    # Also dump per-sample predictions for the benchmarking step
-    import pandas as pd
-    filenames = [os.path.basename(p) for p, _ in test_ds.samples]
-    pred_df = pd.DataFrame({
-        "filename": filenames,
-        "true_label": [classes[i] for i in all_labels],
-        "predicted_label": [classes[i] for i in all_preds],
-    })
-    preds_path = os.path.join(config["output"]["outputs_dir"], "test_predictions.csv")
-    pred_df.to_csv(preds_path, index=False)
-    print(f"Saved per-sample predictions to {preds_path}")
+    out_path = os.path.join(args.output_dir, "confusion_matrix.png")
+    plt.savefig(out_path, dpi=150)
+    print("Saved confusion matrix to", out_path)
 
 
 if __name__ == "__main__":
