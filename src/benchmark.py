@@ -1,18 +1,26 @@
 """Benchmark a trained checkpoint against Gravity Spy ML and volunteer labels.
 
-Joins the model's test-set predictions to the official Gravity Spy label
-CSVs on `gravityspy_id` (confirmed join key across the training-set HDF5,
-the ML-classification CSVs at https://zenodo.org/records/5649212, and the
-volunteer-classification CSV at https://zenodo.org/records/13904422).
+Joins the model's test-set predictions to the official Gravity Spy labels on
+`gravityspy_id`:
+  - ML-classification CSVs, one per detector+run: https://zenodo.org/records/5649212
+  - Volunteer/ML consensus HDF5 (single file, `final_label` column):
+    https://zenodo.org/records/5911227
+
+Note: there is a *different* Zenodo record (13904422) that also has "volunteer
+classifications" in its title, but it's a raw per-vote export keyed on a
+Zooniverse `Subject_id`, not `gravityspy_id` -- it is not usable here without
+a separate aggregation step, so this script expects the 5911227 file instead.
+`download_data.py --volunteer-labels` already downloads the correct one.
 
 Usage (after train.py has produced a checkpoint, and download_data.py has
-pulled the label CSVs):
+pulled the label files):
     python src/benchmark.py \
         --checkpoint checkpoints/best_model.pt \
         --ml-labels data/labels/H1_O3a.csv data/labels/H1_O3b.csv \
-        --volunteer-labels data/labels/classifications.csv
+        --volunteer-labels data/labels/retired_fulldata_min2_max50_ret0p9.hdf5
 
 Either --ml-labels or --volunteer-labels can be omitted if you only have one.
+Reading the volunteer HDF5 requires the `tables` package (pip install tables).
 """
 import argparse
 import os
@@ -32,17 +40,15 @@ def load_ml_labels(paths):
 
 
 def load_volunteer_labels(path):
-    df = pd.read_csv(path)
-    # Column name for the consensus label has varied slightly across Gravity
-    # Spy Zenodo releases -- try the known candidates rather than hardcoding one.
-    candidates = ["label", "ml_label", "final_label", "class"]
-    label_col = next((c for c in candidates if c in df.columns), None)
-    if label_col is None:
-        raise ValueError(
-            f"Couldn't find a label column in {path}. Columns present: "
-            f"{list(df.columns)}. Update `candidates` in load_volunteer_labels()."
-        )
-    df = df.rename(columns={label_col: "volunteer_label"})
+    """Loads the pre-aggregated volunteer+ML consensus dataset.
+
+    Expects the HDF5 file from https://zenodo.org/records/5911227
+    (`retired_fulldata_min2_max50_ret0p9.hdf5`), which has one row per glitch
+    with `gravityspy_id` and `final_label` columns already computed -- no
+    per-vote aggregation needed on our end.
+    """
+    df = pd.read_hdf(path, key="image_db")
+    df = df.rename(columns={"final_label": "volunteer_label"})
     return df[["gravityspy_id", "volunteer_label"]].drop_duplicates("gravityspy_id")
 
 
@@ -57,7 +63,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--ml-labels", nargs="*", default=[], help="path(s) to Gravity Spy ML label CSVs")
-    parser.add_argument("--volunteer-labels", default=None, help="path to the volunteer classifications CSV")
+    parser.add_argument("--volunteer-labels", default=None, help="path to the volunteer consensus HDF5")
     parser.add_argument("--output-dir", default="outputs")
     args = parser.parse_args()
 
@@ -114,7 +120,7 @@ def main():
         vol_df = load_volunteer_labels(args.volunteer_labels)
         results = results.merge(vol_df, on="gravityspy_id", how="left")
         matched = results["volunteer_label"].notna()
-        print(f"Volunteer labels matched: {matched.sum()}/{len(results)} test glitches found in the volunteer CSV")
+        print(f"Volunteer labels matched: {matched.sum()}/{len(results)} test glitches found in the volunteer file")
         if matched.any():
             agree = (results.loc[matched, "model_pred"] == results.loc[matched, "volunteer_label"]).mean()
             print(f"  Your model vs volunteer-consensus label agreement: {agree:.4f}")

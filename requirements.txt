@@ -20,3 +20,4 @@ opencv-python
 matplotlib
 tqdm
 pytest
+tables
