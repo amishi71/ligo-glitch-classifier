@@ -48,12 +48,15 @@ def _read_fixed_format_column(path, group, column):
     without loading the rest of the table.
 
     Background: pandas' 'fixed' HDF5 format splits a DataFrame into blocks
-    by dtype -- numeric columns land together in dense arrays, but
-    string/object columns are stored as individually pickled blobs, one per
-    column. That means each string column is already independently
-    addressable at the HDF5 level; this reads *only* the block containing
-    `column`, ignoring the (likely much larger) numeric blocks entirely.
-    Verified to reconstruct identically to a full `pd.read_hdf()` read.
+    by dtype. Numeric columns land together in dense arrays. Object/string
+    columns are pickled -- and critically, pandas *consolidates* same-dtype
+    object columns into a single block before writing, so multiple string
+    columns typically end up as **one shared pickled blob** (a 2D array,
+    shape (n_rows, n_items_in_block)), not one blob per column. This reads
+    only the block containing `column`, unpickles that one block (small --
+    just the string columns, not the much larger numeric blocks elsewhere
+    in the file), and pulls out the requested column by its position within
+    that block's item list.
     """
     with h5py.File(path, "r") as f:
         g = f[group]
@@ -63,11 +66,23 @@ def _read_fixed_format_column(path, group, column):
             if column in items:
                 col_idx = items.index(column)
                 vals = g[f"block{i}_values"]
-                if vals.dtype == object:
-                    raw = vals[()][col_idx]
-                    return np.array(pickle.loads(raw.tobytes()))
-                arr = vals[()]
-                return arr[:, col_idx] if arr.ndim == 2 else arr[:]
+                if vals.dtype != object:
+                    arr = vals[()]
+                    return arr[:, col_idx] if arr.ndim == 2 else arr[:]
+
+                raw = vals[()]
+                if raw.shape == (1,):
+                    # whole block bundled into a single pickled blob
+                    unpickled = np.asarray(pickle.loads(raw[0].tobytes()))
+                    if unpickled.ndim == 1:
+                        return unpickled
+                    if unpickled.shape[1] == len(items):
+                        return unpickled[:, col_idx]
+                    if unpickled.shape[0] == len(items):
+                        return unpickled[col_idx]
+                    raise ValueError(f"Unexpected unpickled shape {unpickled.shape} for block items {items}")
+                # one pickled blob per column
+                return np.array(pickle.loads(raw[col_idx].tobytes()))
             i += 1
     raise KeyError(f"Column {column!r} not found in {group!r} of {path}")
 
