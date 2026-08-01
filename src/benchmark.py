@@ -24,6 +24,7 @@ Reading the volunteer HDF5 requires the `tables` package (pip install tables).
 """
 import argparse
 import os
+import threading
 import time
 
 import pandas as pd
@@ -48,20 +49,33 @@ def load_volunteer_labels(path):
     with `gravityspy_id` and `final_label` columns already computed -- no
     per-vote aggregation needed on our end.
 
-    This file is ~1GB and a full read can take a minute or two, with no
-    intermediate output from pandas -- printing before/after so this doesn't
-    look like a hang. Tries a column-selective read first (faster, lower
-    memory -- only works if the file is in pytables 'table' format) and
-    falls back to a full read if that's not supported.
+    This file is ~1GB. A single print before/after isn't enough -- if the
+    read genuinely takes several minutes there's nothing to distinguish
+    "working" from "frozen" in between, so a background thread prints a
+    heartbeat every 15s until the read finishes.
     """
-    print(f"Loading volunteer consensus file ({os.path.getsize(path) / 1e9:.2f} GB) -- "
-          f"this can take 1-2 minutes with no visible progress, that's expected...")
+    size_gb = os.path.getsize(path) / 1e9
+    print(f"Loading volunteer consensus file ({size_gb:.2f} GB)...")
+
     t0 = time.time()
+    done = threading.Event()
+
+    def _heartbeat():
+        while not done.wait(15):
+            print(f"  ...still reading, {time.time() - t0:.0f}s elapsed (this file can take several minutes)")
+
+    hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+    hb_thread.start()
     try:
-        df = pd.read_hdf(path, key="image_db", columns=["gravityspy_id", "final_label"])
-    except (TypeError, ValueError):
-        # file is in 'fixed' format, which doesn't support column selection
-        df = pd.read_hdf(path, key="image_db")
+        try:
+            df = pd.read_hdf(path, key="image_db", columns=["gravityspy_id", "final_label"])
+        except (TypeError, ValueError):
+            # file is in 'fixed' format, which doesn't support column selection
+            df = pd.read_hdf(path, key="image_db")
+    finally:
+        done.set()
+        hb_thread.join()
+
     print(f"Loaded {len(df)} rows in {time.time() - t0:.1f}s")
     df = df.rename(columns={"final_label": "volunteer_label"})
     return df[["gravityspy_id", "volunteer_label"]].drop_duplicates("gravityspy_id")
