@@ -24,7 +24,6 @@ Reading the volunteer HDF5 requires the `tables` package (pip install tables).
 """
 import argparse
 import os
-import threading
 import time
 
 import pandas as pd
@@ -41,7 +40,7 @@ def load_ml_labels(paths):
     return df
 
 
-def load_volunteer_labels(path):
+def load_volunteer_labels(path, chunksize=20000):
     """Loads the pre-aggregated volunteer+ML consensus dataset.
 
     Expects the HDF5 file from https://zenodo.org/records/5911227
@@ -49,32 +48,42 @@ def load_volunteer_labels(path):
     with `gravityspy_id` and `final_label` columns already computed -- no
     per-vote aggregation needed on our end.
 
-    This file is ~1GB. A single print before/after isn't enough -- if the
-    read genuinely takes several minutes there's nothing to distinguish
-    "working" from "frozen" in between, so a background thread prints a
-    heartbeat every 15s until the read finishes.
+    The file is ~1GB and has ~20+ columns (per-class ML confidence scores
+    etc.) we don't need. A plain `pd.read_hdf(path)` materializes the whole
+    table -- all columns, all rows -- in memory at once before we get to
+    subset it, which is exactly the kind of spike that gets a process
+    silently OOM-killed on a constrained runtime like Colab's free tier
+    (no Python traceback, the process just disappears -- which is what a
+    genuine hang and an OOM kill both look like from the outside).
+
+    Reading via `HDFStore.select(..., chunksize=...)` instead streams the
+    file row-chunk by row-chunk from disk, and `columns=` drops everything
+    except the two columns needed *before* each chunk is held in memory, so
+    peak memory stays proportional to `chunksize`, not to the file size.
+    This only works if the file is in pytables 'table' format; falls back
+    to a full read (with a warning) for the 'fixed' format, which has no
+    partial-read path.
     """
     size_gb = os.path.getsize(path) / 1e9
-    print(f"Loading volunteer consensus file ({size_gb:.2f} GB)...")
+    print(f"Loading volunteer consensus file ({size_gb:.2f} GB), streaming in chunks of {chunksize}...")
 
     t0 = time.time()
-    done = threading.Event()
-
-    def _heartbeat():
-        while not done.wait(15):
-            print(f"  ...still reading, {time.time() - t0:.0f}s elapsed (this file can take several minutes)")
-
-    hb_thread = threading.Thread(target=_heartbeat, daemon=True)
-    hb_thread.start()
-    try:
-        try:
-            df = pd.read_hdf(path, key="image_db", columns=["gravityspy_id", "final_label"])
-        except (TypeError, ValueError):
-            # file is in 'fixed' format, which doesn't support column selection
-            df = pd.read_hdf(path, key="image_db")
-    finally:
-        done.set()
-        hb_thread.join()
+    with pd.HDFStore(path, mode="r") as store:
+        storer = store.get_storer("image_db")
+        if storer.is_table:
+            chunks = []
+            for i, chunk in enumerate(
+                store.select("image_db", columns=["gravityspy_id", "final_label"], chunksize=chunksize)
+            ):
+                chunks.append(chunk)
+                print(f"  ...read chunk {i + 1} ({sum(len(c) for c in chunks)} rows so far, "
+                      f"{time.time() - t0:.0f}s elapsed)")
+            df = pd.concat(chunks, ignore_index=True)
+        else:
+            print("  File is in pytables 'fixed' format -- no partial-read path exists for it, "
+                  "so this needs a full in-memory load. If this crashes, switch to a High-RAM "
+                  "Colab runtime (Runtime -> Change runtime type) and re-run.")
+            df = store.select("image_db")
 
     print(f"Loaded {len(df)} rows in {time.time() - t0:.1f}s")
     df = df.rename(columns={"final_label": "volunteer_label"})
