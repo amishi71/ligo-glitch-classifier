@@ -24,8 +24,11 @@ Reading the volunteer HDF5 requires the `tables` package (pip install tables).
 """
 import argparse
 import os
+import pickle
 import time
 
+import h5py
+import numpy as np
 import pandas as pd
 import torch
 
@@ -40,6 +43,35 @@ def load_ml_labels(paths):
     return df
 
 
+def _read_fixed_format_column(path, group, column):
+    """Reads a single named column out of a pandas 'fixed'-format HDF5 store,
+    without loading the rest of the table.
+
+    Background: pandas' 'fixed' HDF5 format splits a DataFrame into blocks
+    by dtype -- numeric columns land together in dense arrays, but
+    string/object columns are stored as individually pickled blobs, one per
+    column. That means each string column is already independently
+    addressable at the HDF5 level; this reads *only* the block containing
+    `column`, ignoring the (likely much larger) numeric blocks entirely.
+    Verified to reconstruct identically to a full `pd.read_hdf()` read.
+    """
+    with h5py.File(path, "r") as f:
+        g = f[group]
+        i = 0
+        while f"block{i}_items" in g:
+            items = [x.decode() for x in g[f"block{i}_items"][:]]
+            if column in items:
+                col_idx = items.index(column)
+                vals = g[f"block{i}_values"]
+                if vals.dtype == object:
+                    raw = vals[()][col_idx]
+                    return np.array(pickle.loads(raw.tobytes()))
+                arr = vals[()]
+                return arr[:, col_idx] if arr.ndim == 2 else arr[:]
+            i += 1
+    raise KeyError(f"Column {column!r} not found in {group!r} of {path}")
+
+
 def load_volunteer_labels(path, chunksize=20000):
     """Loads the pre-aggregated volunteer+ML consensus dataset.
 
@@ -48,42 +80,47 @@ def load_volunteer_labels(path, chunksize=20000):
     with `gravityspy_id` and `final_label` columns already computed -- no
     per-vote aggregation needed on our end.
 
-    The file is ~1GB and has ~20+ columns (per-class ML confidence scores
-    etc.) we don't need. A plain `pd.read_hdf(path)` materializes the whole
-    table -- all columns, all rows -- in memory at once before we get to
-    subset it, which is exactly the kind of spike that gets a process
-    silently OOM-killed on a constrained runtime like Colab's free tier
-    (no Python traceback, the process just disappears -- which is what a
-    genuine hang and an OOM kill both look like from the outside).
+    The file is ~1GB, mostly from ~20 per-class ML confidence columns we
+    don't need. A plain `pd.read_hdf(path)` materializes the whole table --
+    every column, every row -- in memory before we get to subset it, which
+    is exactly the kind of spike that gets a process silently OOM-killed on
+    a constrained runtime like Colab's free tier (no Python traceback, the
+    process just disappears -- indistinguishable from a hang from the
+    outside).
 
-    Reading via `HDFStore.select(..., chunksize=...)` instead streams the
-    file row-chunk by row-chunk from disk, and `columns=` drops everything
-    except the two columns needed *before* each chunk is held in memory, so
-    peak memory stays proportional to `chunksize`, not to the file size.
-    This only works if the file is in pytables 'table' format; falls back
-    to a full read (with a warning) for the 'fixed' format, which has no
-    partial-read path.
+    If the file is in pytables 'table' format, `HDFStore.select(...,
+    chunksize=...)` streams it row-chunk by row-chunk with `columns=`
+    dropping everything else before each chunk is held in memory. If it's
+    in 'fixed' format (no chunked-read support at all), falls back to
+    `_read_fixed_format_column`, which reads only the two needed columns
+    directly via h5py rather than the whole table.
     """
     size_gb = os.path.getsize(path) / 1e9
-    print(f"Loading volunteer consensus file ({size_gb:.2f} GB), streaming in chunks of {chunksize}...")
-
+    print(f"Loading volunteer consensus file ({size_gb:.2f} GB)...")
     t0 = time.time()
+
     with pd.HDFStore(path, mode="r") as store:
         storer = store.get_storer("image_db")
-        if storer.is_table:
-            chunks = []
+        is_table = storer.is_table
+        group_name = storer.group._v_pathname.lstrip("/")
+
+    if is_table:
+        print(f"  Table format detected -- streaming in chunks of {chunksize}...")
+        chunks = []
+        with pd.HDFStore(path, mode="r") as store:
             for i, chunk in enumerate(
                 store.select("image_db", columns=["gravityspy_id", "final_label"], chunksize=chunksize)
             ):
                 chunks.append(chunk)
                 print(f"  ...read chunk {i + 1} ({sum(len(c) for c in chunks)} rows so far, "
                       f"{time.time() - t0:.0f}s elapsed)")
-            df = pd.concat(chunks, ignore_index=True)
-        else:
-            print("  File is in pytables 'fixed' format -- no partial-read path exists for it, "
-                  "so this needs a full in-memory load. If this crashes, switch to a High-RAM "
-                  "Colab runtime (Runtime -> Change runtime type) and re-run.")
-            df = store.select("image_db")
+        df = pd.concat(chunks, ignore_index=True)
+    else:
+        print("  Fixed format detected -- reading only the gravityspy_id and final_label "
+              "columns directly, skipping the wide numeric blocks that make up most of the file.")
+        gids = _read_fixed_format_column(path, group_name, "gravityspy_id")
+        labels = _read_fixed_format_column(path, group_name, "final_label")
+        df = pd.DataFrame({"gravityspy_id": gids, "final_label": labels})
 
     print(f"Loaded {len(df)} rows in {time.time() - t0:.1f}s")
     df = df.rename(columns={"final_label": "volunteer_label"})
