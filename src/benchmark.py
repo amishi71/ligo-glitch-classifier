@@ -24,12 +24,11 @@ Reading the volunteer HDF5 requires the `tables` package (pip install tables).
 """
 import argparse
 import os
-import pickle
 import time
 
-import h5py
 import numpy as np
 import pandas as pd
+import tables
 import torch
 
 from dataset import get_dataloaders
@@ -43,51 +42,77 @@ def load_ml_labels(paths):
     return df
 
 
-def _read_fixed_format_column(path, group, column):
-    """Reads a single named column out of a pandas 'fixed'-format HDF5 store,
-    without loading the rest of the table.
+def _decode_if_bytes(arr):
+    """String columns round-tripped through a pickled numpy object block can
+    come back as either `str` or `bytes` elements depending on how they were
+    originally written; normalize to `str`."""
+    arr = np.asarray(arr, dtype=object)
+    if arr.size and isinstance(arr.flat[0], bytes):
+        return np.array([x.decode() for x in arr])
+    return arr
 
-    Background: pandas' 'fixed' HDF5 format splits a DataFrame into blocks
-    by dtype. Numeric columns land together in dense arrays. Object/string
-    columns are pickled -- and critically, pandas *consolidates* same-dtype
-    object columns into a single block before writing, so multiple string
-    columns typically end up as **one shared pickled blob** (a 2D array,
-    shape (n_rows, n_items_in_block)), not one blob per column. This reads
-    only the block containing `column`, unpickles that one block (small --
-    just the string columns, not the much larger numeric blocks elsewhere
-    in the file), and pulls out the requested column by its position within
-    that block's item list.
+
+def _read_fixed_format_columns(path, group, columns):
+    """Reads a set of named columns out of a pandas 'fixed'-format HDF5
+    store, without loading the (much larger) numeric blocks.
+
+    Background: pandas' 'fixed' HDF5 format groups a DataFrame's columns
+    into blocks by dtype. Numeric blocks land as plain dense arrays and are
+    cheap to read with either h5py or PyTables. Object/string blocks are
+    different: pandas pickles the *entire* block (every string column,
+    every row) as a single object and writes it as one row of a PyTables
+    `VLArray` with `ObjectAtom`.
+
+    Reading that block via PyTables (as this function does) hands back the
+    already-deserialized array directly -- PyTables wrote it, so PyTables
+    reads it back correctly. Reading it via raw h5py instead only gives you
+    the opaque serialized bytes, and reconstructing those by hand (manual
+    `pickle.loads`, guessing at `.tobytes()` and array orientation) means
+    guessing at an internal, version-dependent pandas/PyTables encoding --
+    which is what was hanging/misbehaving before this fix.
+
+    Reads every requested column in a single pass over the file (no
+    re-opening or re-unpickling the same block once per column).
+
+    Returns a dict {column_name: 1-D array}.
     """
-    with h5py.File(path, "r") as f:
-        g = f[group]
+    remaining = set(columns)
+    found = {}
+    with tables.open_file(path, mode="r") as h5file:
+        group_node = h5file.get_node("/" + group)
         i = 0
-        while f"block{i}_items" in g:
-            items = [x.decode() for x in g[f"block{i}_items"][:]]
-            if column in items:
-                col_idx = items.index(column)
-                vals = g[f"block{i}_values"]
-                if vals.dtype != object:
-                    arr = vals[()]
-                    return arr[:, col_idx] if arr.ndim == 2 else arr[:]
-
-                raw = vals[()]
-                if raw.shape == (1,):
-                    # whole block bundled into a single pickled blob
-                    unpickled = np.asarray(pickle.loads(raw[0].tobytes()))
-                    if unpickled.ndim == 1:
-                        return unpickled
-                    if unpickled.shape[1] == len(items):
-                        return unpickled[:, col_idx]
-                    if unpickled.shape[0] == len(items):
-                        return unpickled[col_idx]
-                    raise ValueError(f"Unexpected unpickled shape {unpickled.shape} for block items {items}")
-                # one pickled blob per column
-                return np.array(pickle.loads(raw[col_idx].tobytes()))
+        while remaining and hasattr(group_node, f"block{i}_items"):
+            items = [c.decode() if isinstance(c, bytes) else c
+                     for c in getattr(group_node, f"block{i}_items")[:]]
+            wanted_here = remaining & set(items)
+            if wanted_here:
+                values_node = getattr(group_node, f"block{i}_values")
+                block = values_node[:]
+                if block.dtype == object and block.shape[0] == 1:
+                    # whole block was pickled together as one VLArray row;
+                    # PyTables has already unpickled it for us here
+                    block = np.asarray(block[0])
+                for col in wanted_here:
+                    col_idx = items.index(col)
+                    if block.ndim == 1:
+                        col_vals = block
+                    elif block.shape[1] == len(items):
+                        col_vals = block[:, col_idx]
+                    elif block.shape[0] == len(items):
+                        col_vals = block[col_idx]
+                    else:
+                        raise ValueError(
+                            f"Unexpected block shape {block.shape} for items {items}"
+                        )
+                    found[col] = _decode_if_bytes(col_vals)
+                remaining -= wanted_here
             i += 1
-    raise KeyError(f"Column {column!r} not found in {group!r} of {path}")
+    if remaining:
+        raise KeyError(f"Column(s) {remaining} not found in {group!r} of {path}")
+    return found
 
 
-def load_volunteer_labels(path, chunksize=20000):
+def load_volunteer_labels(path):
     """Loads the pre-aggregated volunteer+ML consensus dataset.
 
     Expects the HDF5 file from https://zenodo.org/records/5911227
@@ -101,14 +126,14 @@ def load_volunteer_labels(path, chunksize=20000):
     is exactly the kind of spike that gets a process silently OOM-killed on
     a constrained runtime like Colab's free tier (no Python traceback, the
     process just disappears -- indistinguishable from a hang from the
-    outside).
+    outside). So this reads only the two needed columns directly.
 
     If the file is in pytables 'table' format, `HDFStore.select(...,
     chunksize=...)` streams it row-chunk by row-chunk with `columns=`
     dropping everything else before each chunk is held in memory. If it's
     in 'fixed' format (no chunked-read support at all), falls back to
-    `_read_fixed_format_column`, which reads only the two needed columns
-    directly via h5py rather than the whole table.
+    `_read_fixed_format_columns`, which reads only the two needed columns
+    via PyTables directly rather than the whole table.
     """
     size_gb = os.path.getsize(path) / 1e9
     print(f"Loading volunteer consensus file ({size_gb:.2f} GB)...")
@@ -120,6 +145,7 @@ def load_volunteer_labels(path, chunksize=20000):
         group_name = storer.group._v_pathname.lstrip("/")
 
     if is_table:
+        chunksize = 20000
         print(f"  Table format detected -- streaming in chunks of {chunksize}...")
         chunks = []
         with pd.HDFStore(path, mode="r") as store:
@@ -132,10 +158,12 @@ def load_volunteer_labels(path, chunksize=20000):
         df = pd.concat(chunks, ignore_index=True)
     else:
         print("  Fixed format detected -- reading only the gravityspy_id and final_label "
-              "columns directly, skipping the wide numeric blocks that make up most of the file.")
-        gids = _read_fixed_format_column(path, group_name, "gravityspy_id")
-        labels = _read_fixed_format_column(path, group_name, "final_label")
-        df = pd.DataFrame({"gravityspy_id": gids, "final_label": labels})
+              "columns directly (via PyTables), skipping the wide numeric blocks that make "
+              "up most of the file.")
+        cols = _read_fixed_format_columns(path, group_name, ["gravityspy_id", "final_label"])
+        print(f"  ...read {len(cols['gravityspy_id'])} rows in {time.time() - t0:.1f}s, "
+              "building DataFrame...")
+        df = pd.DataFrame({"gravityspy_id": cols["gravityspy_id"], "final_label": cols["final_label"]})
 
     print(f"Loaded {len(df)} rows in {time.time() - t0:.1f}s")
     df = df.rename(columns={"final_label": "volunteer_label"})
